@@ -38,7 +38,7 @@ type AnalyticServer struct {
 	spannerClient   *spanner.Client
 	dockerClient    *client.Client
 	redisClient     *redis.Client
-	pubsubClient    *pubsub.Client // For Fleet Event Bus emission
+	pubsubClient    *pubsub.Client
 	ollamaURL       string
 	logger          *whisper.WhisperLog
 }
@@ -53,15 +53,9 @@ func (s *AnalyticServer) GetDownloadURL(ctx context.Context, req *connect.Reques
 
 func (s *AnalyticServer) UploadObject(ctx context.Context, req *connect.Request[analyticv1.UploadRequest]) (*connect.Response[analyticv1.UploadResponse], error) {
 	wc := s.storageClient.Bucket(req.Msg.Bucket).Object(req.Msg.Name).NewWriter(ctx)
-	if _, err := wc.Write(req.Msg.Data); err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
-	}
-	if err := wc.Close(); err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
-	}
+	if _, err := wc.Write(req.Msg.Data); err != nil { return nil, connect.NewError(connect.CodeInternal, err) }
+	if err := wc.Close(); err != nil { return nil, connect.NewError(connect.CodeInternal, err) }
 
-	// HIGH-FIDELITY DEEPENING: Emit Substrate Event to Fleet Bus
-	slog.Info("AnalyticManager: Emitting GCS Substrate Event", "bucket", req.Msg.Bucket, "object", req.Msg.Name)
 	topic := s.pubsubClient.Topic("substrate-events")
 	event := map[string]string{
 		"type":   "GCS_OBJECT_FINALIZE",
@@ -79,12 +73,8 @@ func (s *AnalyticServer) UploadObject(ctx context.Context, req *connect.Request[
 
 func (s *AnalyticServer) Upsert(ctx context.Context, req *connect.Request[analyticv1.UpsertRequest]) (*connect.Response[analyticv1.StatusResponse], error) {
 	var data map[string]interface{}
-	if err := json.Unmarshal([]byte(req.Msg.DataJson), &data); err != nil {
-		return nil, connect.NewError(connect.CodeInvalidArgument, err)
-	}
-	if _, err := s.firestoreClient.Collection(req.Msg.Collection).Doc(req.Msg.DocId).Set(ctx, data); err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
-	}
+	if err := json.Unmarshal([]byte(req.Msg.DataJson), &data); err != nil { return nil, connect.NewError(connect.CodeInvalidArgument, err) }
+	if _, err := s.firestoreClient.Collection(req.Msg.Collection).Doc(req.Msg.DocId).Set(ctx, data); err != nil { return nil, connect.NewError(connect.CodeInternal, err) }
 	return connect.NewResponse(&analyticv1.StatusResponse{Success: true}), nil
 }
 
@@ -119,24 +109,37 @@ func (s *AnalyticServer) QueryBigQuery(ctx context.Context, req *connect.Request
 	return connect.NewResponse(&analyticv1.JSONResponse{Json: string(out), Count: int64(len(results))}), nil
 }
 
-// --- Relational / Cloud SQL ---
+// --- Relational / Cloud SQL (Deepening) ---
 
 func (s *AnalyticServer) ExecuteSQL(ctx context.Context, req *connect.Request[analyticv1.SQLRequest]) (*connect.Response[analyticv1.JSONResponse], error) {
+	slog.Info("AnalyticManager: Deep SQL execution", "instance", req.Msg.InstanceId)
 	db, err := sql.Open("postgres", "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable")
 	if err != nil { return nil, connect.NewError(connect.CodeInternal, err) }
 	defer db.Close()
+
 	rows, err := db.QueryContext(ctx, req.Msg.Query)
 	if err != nil { return nil, connect.NewError(connect.CodeInternal, err) }
 	defer rows.Close()
-	return connect.NewResponse(&analyticv1.JSONResponse{Json: "[]", Count: 0}), nil
+
+	cols, _ := rows.Columns()
+	var results []map[string]interface{}
+	for rows.Next() {
+		columns := make([]interface{}, len(cols))
+		columnPointers := make([]interface{}, len(cols))
+		for i := range columns { columnPointers[i] = &columns[i] }
+		if err := rows.Scan(columnPointers...); err != nil { return nil, connect.NewError(connect.CodeInternal, err) }
+		m := make(map[string]interface{})
+		for i, colName := range cols { m[colName] = columns[i] }
+		results = append(results, m)
+	}
+	out, _ := json.Marshal(results)
+	return connect.NewResponse(&analyticv1.JSONResponse{Json: string(out), Count: int64(len(results))}), nil
 }
 
 // --- Cache / MemoryStore ---
 
 func (s *AnalyticServer) SetCache(ctx context.Context, req *connect.Request[analyticv1.CacheRequest]) (*connect.Response[analyticv1.StatusResponse], error) {
-	if err := s.redisClient.Set(ctx, req.Msg.Key, req.Msg.Value, 0).Err(); err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
-	}
+	if err := s.redisClient.Set(ctx, req.Msg.Key, req.Msg.Value, 0).Err(); err != nil { return nil, connect.NewError(connect.CodeInternal, err) }
 	return connect.NewResponse(&analyticv1.StatusResponse{Success: true}), nil
 }
 
@@ -146,7 +149,7 @@ func (s *AnalyticServer) GetCache(ctx context.Context, req *connect.Request[anal
 	return connect.NewResponse(&analyticv1.JSONResponse{Json: val, Count: 1}), nil
 }
 
-// --- AI / Vertex / Ollama ---
+// --- AI / Vertex / Ollama (Deepening) ---
 
 func (s *AnalyticServer) Predict(ctx context.Context, req *connect.Request[analyticv1.PredictRequest]) (*connect.Response[analyticv1.PredictResponse], error) {
 	ollamaReq := map[string]interface{}{"model": req.Msg.Model, "prompt": req.Msg.Prompt, "stream": false}
@@ -160,10 +163,17 @@ func (s *AnalyticServer) Predict(ctx context.Context, req *connect.Request[analy
 }
 
 func (s *AnalyticServer) Embed(ctx context.Context, req *connect.Request[analyticv1.EmbedRequest]) (*connect.Response[analyticv1.EmbedResponse], error) {
-	return connect.NewResponse(&analyticv1.EmbedResponse{Values: []float32{0.1, 0.2}}), nil
+	ollamaReq := map[string]interface{}{"model": req.Msg.Model, "prompt": req.Msg.Content}
+	body, _ := json.Marshal(ollamaReq)
+	resp, err := http.Post(s.ollamaURL+"/api/embeddings", "application/json", bytes.NewBuffer(body))
+	if err != nil { return nil, connect.NewError(connect.CodeInternal, err) }
+	defer resp.Body.Close()
+	var res struct { Embedding []float32 `json:"embedding"` }
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil { return nil, connect.NewError(connect.CodeInternal, err) }
+	return connect.NewResponse(&analyticv1.EmbedResponse{Values: res.Embedding}), nil
 }
 
-// --- Cloud Spanner ---
+// --- Cloud Spanner (Deepening) ---
 
 func (s *AnalyticServer) SpannerQuery(ctx context.Context, req *connect.Request[analyticv1.SpannerRequest]) (*connect.Response[analyticv1.JSONResponse], error) {
 	stmt := spanner.Statement{SQL: req.Msg.Query}
@@ -171,31 +181,36 @@ func (s *AnalyticServer) SpannerQuery(ctx context.Context, req *connect.Request[
 	defer iter.Stop()
 	var results []map[string]interface{}
 	for {
-		_, err := iter.Next()
+		row, err := iter.Next()
 		if err == iterator.Done { break }
 		if err != nil { return nil, connect.NewError(connect.CodeInternal, err) }
-		results = append(results, map[string]interface{}{"status": "read_from_emulator"})
+		
+		m := make(map[string]interface{})
+		for i := 0; i < row.Size(); i++ {
+			var val spanner.GenericColumnValue
+			row.Column(i, &val)
+			m[row.ColumnName(i)] = val
+		}
+		results = append(results, m)
 	}
 	out, _ := json.Marshal(results)
 	return connect.NewResponse(&analyticv1.JSONResponse{Json: string(out), Count: int64(len(results))}), nil
 }
 
 func main() {
-	slog.Info("AnalyticManager: Booting Data & AI Substrate (Phase 7)...")
+	slog.Info("AnalyticManager: Booting Data & AI Substrate (Phase 8)...")
 	w := whisper.New("AnalyticManager", "gcp_analytic.lpsv")
 	defer w.Close()
 
 	ctx := context.Background()
 	projectID := "olympus-project"
 
-	// Spanner Emulator
 	spannerHost := os.Getenv("SPANNER_EMULATOR_HOST")
 	if spannerHost == "" { spannerHost = "localhost:9010" }
 	os.Setenv("SPANNER_EMULATOR_HOST", spannerHost)
 	dbStr := fmt.Sprintf("projects/%s/instances/test-instance/databases/test-db", projectID)
 	spClient, _ := spanner.NewClient(ctx, dbStr)
 
-	// PubSub Emulator (Emission Bus)
 	psHost := os.Getenv("PUBSUB_EMULATOR_HOST")
 	if psHost == "" { psHost = "localhost:8085" }
 	psClient, _ := pubsub.NewClient(ctx, projectID, option.WithEndpoint(psHost), option.WithoutAuthentication())

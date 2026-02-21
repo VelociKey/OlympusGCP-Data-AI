@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package olympus.analytic.v1;
+
+option go_package = "OlympusGCP-Data-AI/40000-Communication-Contracts/430-Protocol-Definitions/000-gen/analytic/v1;analyticv1";
+
+service AnalyticService {
+  // --- Cloud Storage (GCS) ---
+  rpc GetDownloadURL(GCSRequest) returns (GCSResponse);
+  rpc UploadObject(UploadRequest) returns (UploadResponse);
+
+  // --- NoSQL / Firestore ---
+  rpc Upsert(UpsertRequest) returns (StatusResponse);
+  rpc QueryData(QueryRequest) returns (JSONResponse);
+
+  // --- Analytics / BigQuery ---
+  rpc QueryBigQuery(BigQueryRequest) returns (JSONResponse);
+
+  // --- Relational / Cloud SQL ---
+  rpc ExecuteSQL(SQLRequest) returns (JSONResponse);
+
+  // --- Cache / MemoryStore ---
+  rpc SetCache(CacheRequest) returns (StatusResponse);
+  rpc GetCache(CacheRequest) returns (JSONResponse);
+
+  // --- AI / Vertex / Ollama ---
+  rpc Predict(PredictRequest) returns (PredictResponse);
+  rpc Embed(EmbedRequest) returns (EmbedResponse);
+
+  // --- Cloud Spanner (Expansion) ---
+  rpc SpannerQuery(SpannerRequest) returns (JSONResponse);
+}
+
+// Common Messages
+message StatusResponse { bool success = 1; }
+message JSONResponse { string json = 1; int64 count = 2; }
+
+// Storage Messages
+message GCSRequest { string bucket = 1; string name = 2; }
+message GCSResponse { string url = 1; }
+message UploadRequest { string bucket = 1; string name = 2; bytes data = 3; }
+message UploadResponse { string path = 1; }
+
+// NoSQL Messages
+message UpsertRequest { string collection = 1; string doc_id = 2; string data_json = 3; }
+message QueryRequest { string collection = 1; string filter = 2; }
+
+// BigQuery Messages
+message BigQueryRequest { string query = 1; }
+
+// SQL Messages
+message SQLRequest { string instance_id = 2; string query = 3; }
+
+// Cache Messages
+message CacheRequest { string key = 1; string value = 2; }
+
+// AI Messages
+message PredictRequest { string prompt = 1; string model = 2; }
+message PredictResponse { string prediction = 1; string usage_json = 2; }
+message EmbedRequest { string content = 1; string model = 2; }
+message EmbedResponse { repeated float values = 1; }
+
+// Spanner Messages
+message SpannerRequest { string database = 1; string query = 2; }

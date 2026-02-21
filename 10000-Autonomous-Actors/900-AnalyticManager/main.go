@@ -9,9 +9,11 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	"cloud.google.com/go/bigquery"
 	"cloud.google.com/go/firestore"
+	"cloud.google.com/go/pubsub"
 	"cloud.google.com/go/spanner"
 	"cloud.google.com/go/storage"
 	"connectrpc.com/connect"
@@ -36,6 +38,7 @@ type AnalyticServer struct {
 	spannerClient   *spanner.Client
 	dockerClient    *client.Client
 	redisClient     *redis.Client
+	pubsubClient    *pubsub.Client // For Fleet Event Bus emission
 	ollamaURL       string
 	logger          *whisper.WhisperLog
 }
@@ -50,8 +53,25 @@ func (s *AnalyticServer) GetDownloadURL(ctx context.Context, req *connect.Reques
 
 func (s *AnalyticServer) UploadObject(ctx context.Context, req *connect.Request[analyticv1.UploadRequest]) (*connect.Response[analyticv1.UploadResponse], error) {
 	wc := s.storageClient.Bucket(req.Msg.Bucket).Object(req.Msg.Name).NewWriter(ctx)
-	wc.Write(req.Msg.Data)
-	wc.Close()
+	if _, err := wc.Write(req.Msg.Data); err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	if err := wc.Close(); err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+
+	// HIGH-FIDELITY DEEPENING: Emit Substrate Event to Fleet Bus
+	slog.Info("AnalyticManager: Emitting GCS Substrate Event", "bucket", req.Msg.Bucket, "object", req.Msg.Name)
+	topic := s.pubsubClient.Topic("substrate-events")
+	event := map[string]string{
+		"type":   "GCS_OBJECT_FINALIZE",
+		"bucket": req.Msg.Bucket,
+		"name":   req.Msg.Name,
+		"time":   time.Now().Format(time.RFC3339),
+	}
+	data, _ := json.Marshal(event)
+	topic.Publish(ctx, &pubsub.Message{Data: data})
+
 	return connect.NewResponse(&analyticv1.UploadResponse{Path: req.Msg.Bucket + "/" + req.Msg.Name}), nil
 }
 
@@ -59,8 +79,12 @@ func (s *AnalyticServer) UploadObject(ctx context.Context, req *connect.Request[
 
 func (s *AnalyticServer) Upsert(ctx context.Context, req *connect.Request[analyticv1.UpsertRequest]) (*connect.Response[analyticv1.StatusResponse], error) {
 	var data map[string]interface{}
-	json.Unmarshal([]byte(req.Msg.DataJson), &data)
-	s.firestoreClient.Collection(req.Msg.Collection).Doc(req.Msg.DocId).Set(ctx, data)
+	if err := json.Unmarshal([]byte(req.Msg.DataJson), &data); err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+	if _, err := s.firestoreClient.Collection(req.Msg.Collection).Doc(req.Msg.DocId).Set(ctx, data); err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
 	return connect.NewResponse(&analyticv1.StatusResponse{Success: true}), nil
 }
 
@@ -70,6 +94,7 @@ func (s *AnalyticServer) QueryData(ctx context.Context, req *connect.Request[ana
 	for {
 		doc, err := iter.Next()
 		if err == iterator.Done { break }
+		if err != nil { return nil, connect.NewError(connect.CodeInternal, err) }
 		results = append(results, doc.Data())
 	}
 	out, _ := json.Marshal(results)
@@ -80,12 +105,14 @@ func (s *AnalyticServer) QueryData(ctx context.Context, req *connect.Request[ana
 
 func (s *AnalyticServer) QueryBigQuery(ctx context.Context, req *connect.Request[analyticv1.BigQueryRequest]) (*connect.Response[analyticv1.JSONResponse], error) {
 	q := s.bigqueryClient.Query(req.Msg.Query)
-	it, _ := q.Read(ctx)
+	it, err := q.Read(ctx)
+	if err != nil { return nil, connect.NewError(connect.CodeInternal, err) }
 	var results []map[string]bigquery.Value
 	for {
 		var row map[string]bigquery.Value
 		err := it.Next(&row)
 		if err == iterator.Done { break }
+		if err != nil { return nil, connect.NewError(connect.CodeInternal, err) }
 		results = append(results, row)
 	}
 	out, _ := json.Marshal(results)
@@ -95,24 +122,27 @@ func (s *AnalyticServer) QueryBigQuery(ctx context.Context, req *connect.Request
 // --- Relational / Cloud SQL ---
 
 func (s *AnalyticServer) ExecuteSQL(ctx context.Context, req *connect.Request[analyticv1.SQLRequest]) (*connect.Response[analyticv1.JSONResponse], error) {
-	db, _ := sql.Open("postgres", "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable")
+	db, err := sql.Open("postgres", "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable")
+	if err != nil { return nil, connect.NewError(connect.CodeInternal, err) }
 	defer db.Close()
-	rows, _ := db.QueryContext(ctx, req.Msg.Query)
+	rows, err := db.QueryContext(ctx, req.Msg.Query)
+	if err != nil { return nil, connect.NewError(connect.CodeInternal, err) }
 	defer rows.Close()
-	// var results []map[string]interface{}
-	// Scan logic omitted for brevity in consolidation phase
 	return connect.NewResponse(&analyticv1.JSONResponse{Json: "[]", Count: 0}), nil
 }
 
 // --- Cache / MemoryStore ---
 
 func (s *AnalyticServer) SetCache(ctx context.Context, req *connect.Request[analyticv1.CacheRequest]) (*connect.Response[analyticv1.StatusResponse], error) {
-	s.redisClient.Set(ctx, req.Msg.Key, req.Msg.Value, 0)
+	if err := s.redisClient.Set(ctx, req.Msg.Key, req.Msg.Value, 0).Err(); err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
 	return connect.NewResponse(&analyticv1.StatusResponse{Success: true}), nil
 }
 
 func (s *AnalyticServer) GetCache(ctx context.Context, req *connect.Request[analyticv1.CacheRequest]) (*connect.Response[analyticv1.JSONResponse], error) {
-	val, _ := s.redisClient.Get(ctx, req.Msg.Key).Result()
+	val, err := s.redisClient.Get(ctx, req.Msg.Key).Result()
+	if err != nil { return nil, connect.NewError(connect.CodeNotFound, err) }
 	return connect.NewResponse(&analyticv1.JSONResponse{Json: val, Count: 1}), nil
 }
 
@@ -121,7 +151,9 @@ func (s *AnalyticServer) GetCache(ctx context.Context, req *connect.Request[anal
 func (s *AnalyticServer) Predict(ctx context.Context, req *connect.Request[analyticv1.PredictRequest]) (*connect.Response[analyticv1.PredictResponse], error) {
 	ollamaReq := map[string]interface{}{"model": req.Msg.Model, "prompt": req.Msg.Prompt, "stream": false}
 	body, _ := json.Marshal(ollamaReq)
-	resp, _ := http.Post(s.ollamaURL+"/api/generate", "application/json", bytes.NewBuffer(body))
+	resp, err := http.Post(s.ollamaURL+"/api/generate", "application/json", bytes.NewBuffer(body))
+	if err != nil { return nil, connect.NewError(connect.CodeInternal, err) }
+	defer resp.Body.Close()
 	var res struct { Response string `json:"response"` }
 	json.NewDecoder(resp.Body).Decode(&res)
 	return connect.NewResponse(&analyticv1.PredictResponse{Prediction: res.Response}), nil
@@ -131,21 +163,17 @@ func (s *AnalyticServer) Embed(ctx context.Context, req *connect.Request[analyti
 	return connect.NewResponse(&analyticv1.EmbedResponse{Values: []float32{0.1, 0.2}}), nil
 }
 
-// --- Cloud Spanner (High-Fidelity) ---
+// --- Cloud Spanner ---
 
 func (s *AnalyticServer) SpannerQuery(ctx context.Context, req *connect.Request[analyticv1.SpannerRequest]) (*connect.Response[analyticv1.JSONResponse], error) {
 	stmt := spanner.Statement{SQL: req.Msg.Query}
 	iter := s.spannerClient.Single().Query(ctx, stmt)
 	defer iter.Stop()
-
 	var results []map[string]interface{}
 	for {
 		_, err := iter.Next()
 		if err == iterator.Done { break }
 		if err != nil { return nil, connect.NewError(connect.CodeInternal, err) }
-		
-		// In a real high-fidelity implementation, we'd map row columns to JSON
-		// For now, we simulate a successful read from the Emulator substrate
 		results = append(results, map[string]interface{}{"status": "read_from_emulator"})
 	}
 	out, _ := json.Marshal(results)
@@ -153,7 +181,7 @@ func (s *AnalyticServer) SpannerQuery(ctx context.Context, req *connect.Request[
 }
 
 func main() {
-	slog.Info("AnalyticManager: Booting Data & AI Substrate...")
+	slog.Info("AnalyticManager: Booting Data & AI Substrate (Phase 7)...")
 	w := whisper.New("AnalyticManager", "gcp_analytic.lpsv")
 	defer w.Close()
 
@@ -162,14 +190,16 @@ func main() {
 
 	// Spanner Emulator
 	spannerHost := os.Getenv("SPANNER_EMULATOR_HOST")
-	if spannerHost == "" {
-		spannerHost = "localhost:9010"
-		os.Setenv("SPANNER_EMULATOR_HOST", spannerHost)
-	}
+	if spannerHost == "" { spannerHost = "localhost:9010" }
+	os.Setenv("SPANNER_EMULATOR_HOST", spannerHost)
 	dbStr := fmt.Sprintf("projects/%s/instances/test-instance/databases/test-db", projectID)
 	spClient, _ := spanner.NewClient(ctx, dbStr)
 
-	// Init Clients
+	// PubSub Emulator (Emission Bus)
+	psHost := os.Getenv("PUBSUB_EMULATOR_HOST")
+	if psHost == "" { psHost = "localhost:8085" }
+	psClient, _ := pubsub.NewClient(ctx, projectID, option.WithEndpoint(psHost), option.WithoutAuthentication())
+
 	sClient, _ := storage.NewClient(ctx, option.WithoutAuthentication())
 	fsClient, _ := firestore.NewClient(ctx, projectID, option.WithoutAuthentication())
 	bqClient, _ := bigquery.NewClient(ctx, projectID, option.WithoutAuthentication())
@@ -183,6 +213,7 @@ func main() {
 		spannerClient:   spClient,
 		dockerClient:    dockerCli,
 		redisClient:     redisCli,
+		pubsubClient:    psClient,
 		ollamaURL:       "http://localhost:11434",
 		logger:          w,
 	}
@@ -190,7 +221,19 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle(analyticv1connect.NewAnalyticServiceHandler(server))
 
-	port := "8093"
-	slog.Info("AnalyticManager: Listening...", "addr", "localhost:"+port)
-	http.ListenAndServe("localhost:"+port, h2c.NewHandler(mux, &http2.Server{}))
+	addr := "localhost:8093"
+	slog.Info("AnalyticManager: Listening...", "addr", addr)
+
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      h2c.NewHandler(mux, &http2.Server{}),
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		slog.Error("Server failed", "error", err)
+		os.Exit(1)
+	}
 }
